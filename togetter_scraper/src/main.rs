@@ -466,15 +466,15 @@ fn generate_markdown(records: &[Record], generated_at: &str) -> String {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    let webhook_urls: Vec<String> = args.webhook_urls;
-    let translate: bool = args.translate;
-    let lang: String = args.lang;
-    let keywords: Vec<String> = args.keywords;
-    let categories: Vec<String> = args.categories;
-    let url: Option<String> = args.url;
-    let discord: bool = args.discord;
-    let output_md: Option<String> = args.output_md;
-    let output_jsonl: Option<String> = args.output_jsonl;
+    let webhook_urls = args.webhook_urls;
+    let translate = args.translate;
+    let lang = args.lang;
+    let keywords = args.keywords;
+    let categories = args.categories;
+    let url = args.url;
+    let discord = args.discord;
+    let output_md = args.output_md;
+    let output_jsonl = args.output_jsonl;
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -501,43 +501,40 @@ async fn main() -> Result<()> {
             }
         }
 
-        // FIX: record.as_ref() で borrow。ムーブしない。
-        if let Some(rec) = record.as_ref() {
-            if let Some(path) = &output_md {
-                let md = generate_markdown(
-                    &[rec.clone()],
-                    &Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-                );
-                std::fs::write(path, md)?;
-                println!("Markdown saved to: {}", path);
-            }
+        match record {
+            Some(rec) => {
+                let rec_slice: &[Record] = std::slice::from_ref(&rec);
+                if let Some(path) = output_md {
+                    let md = generate_markdown(
+                        rec_slice,
+                        &Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                    );
+                    std::fs::write(&path, md)?;
+                    println!("Markdown saved to: {}", path);
+                }
 
-            if let Some(path) = &output_jsonl {
-                let filtered = filter_records_by_keywords(&[rec.clone()], &keywords);
-                if filtered.is_empty() {
-                    println!("Warning: Record did not match keywords. JSONL not written.");
-                } else {
-                    write_jsonl(&filtered, path)?;
+                if let Some(path) = output_jsonl {
+                    let filtered = filter_records_by_keywords(rec_slice, &keywords);
+                    if filtered.is_empty() {
+                        println!("Warning: Record did not match keywords. JSONL not written.");
+                    } else {
+                        write_jsonl(&filtered, &path)?;
+                    }
                 }
             }
-        } else {
-            if output_md.is_some() {
-                println!("Warning: No record generated. Markdown file not written.");
-            }
-            if output_jsonl.is_some() {
-                println!("Warning: No record generated. JSONL file not written.");
+            None => {
+                if output_md.is_some() {
+                    println!("Warning: No record generated. Markdown file not written.");
+                }
+                if output_jsonl.is_some() {
+                    println!("Warning: No record generated. JSONL file not written.");
+                }
             }
         }
         return Ok(());
-    } 
-    
-    let category_list: Vec<String> = if categories.is_empty() {
-        vec!["recentpopular".to_string()]
-    } else {
-        categories
-    };
+    }
 
-    let cat_tasks: Vec<_> = category_list.into_iter().map(|cat| {
+    let cat_tasks: Vec<_> = categories.into_iter().map(|cat| {
         let state = state.clone();
         tokio::spawn(async move { process_category(&state, &cat).await })
     }).collect();
@@ -606,19 +603,19 @@ async fn main() -> Result<()> {
         records
     };
 
-    if let Some(path) = output_md {
+    if let Some(path) = &output_md {
         if !filtered_records.is_empty() {
             let md = generate_markdown(&filtered_records, &Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
-            std::fs::write(&path, md)?;
+            std::fs::write(path, md)?;
             println!("Markdown saved to: {}", path);
         } else {
             println!("Warning: No records collected. Markdown file not written.");
         }
     }
 
-    if let Some(path) = output_jsonl {
+    if let Some(path) = &output_jsonl {
         if !filtered_records.is_empty() {
-            write_jsonl(&filtered_records, &path)?;
+            write_jsonl(&filtered_records, path)?;
         } else {
             println!("Warning: No records collected. JSONL file not written.");
         }

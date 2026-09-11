@@ -1,72 +1,39 @@
-import httpx
-import asyncio
-from bs4 import BeautifulSoup
-import re
-import json
 import argparse
-from datetime import datetime
-import sys
+import asyncio
+import json
 import random
+import re
+from datetime import datetime
+from typing import List, Optional
 
-BASE_URL = 'https://togetter.com/'
+import httpx
+from bs4 import BeautifulSoup
+
+# Configuration
+BASE_URL = "https://togetter.com/"
 PAGES_TO_SCRAPE = 5
-
-DISCORD_WEBHOOK_URLS = []
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
-}
-
 DISCORD_MSG_LIMIT = 1990
 
+# Semaphores for concurrency
 fetch_sem = asyncio.Semaphore(4)
 discord_sem = asyncio.Semaphore(2)
 translate_sem = asyncio.Semaphore(2)
 
-_translation_cache = {}
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/114.0.0.0 Safari/537.36"
+    )
+}
 
 
-# ==================== JSONL / TTS 連携用 ====================
-
-def filter_records_by_keywords(records, keywords):
-    """キーワードフィルタ（大文字小文字区別なし）。返すレコードは通常の辞書"""
-    if not keywords:
-        return records
-    filtered = []
-    for rec in records:
-        content = f"{rec['title']} {rec['description']}"
-        if any(kw.lower() in content.lower() for kw in keywords):
-            filtered.append(rec)
-    return filtered
-
-
-def write_jsonl(records, filepath):
-    """TTS スクリプトが期待する最小形式で JSONL を書き出す"""
-    count = 0
-    with open(filepath, "w", encoding="utf-8") as f:
-        for rec in records:
-            text_parts = [rec['title']]
-            if rec.get('description'):
-                text_parts.append(rec['description'])
-            entry = {
-                "text": "。".join(text_parts),
-                "url": rec['link']
-            }
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-            count += 1
-    print(f"JSONL saved to: {filepath} ({count} records)")
-
-
-# ==================== 既存の関数 ====================
-
-async def fetch_html(client, url, max_retries=6):
-    """セマフォはリクエスト送信のみ保持。sleep/判定は解放後。"""
+async def fetch_html(client: httpx.AsyncClient, url: str, max_retries: int = 6) -> Optional[str]:
+    """Fetch HTML with retries and concurrency limit."""
     for attempt in range(max_retries):
         try:
             async with fetch_sem:
                 response = await client.get(url, headers=HEADERS, timeout=30.0)
-
-            # セマフォ解放後
             if response.status_code == 200:
                 print(f"{url} succeed! {attempt + 1}")
                 return response.text
@@ -84,44 +51,54 @@ async def fetch_html(client, url, max_retries=6):
     return None
 
 
-def parse_page(html):
-    soup = BeautifulSoup(html, 'html.parser')
+def parse_page(html: str) -> List[str]:
+    """Extract /li/ links from listing page."""
+    soup = BeautifulSoup(html, "html.parser")
     urllist = []
-
-    for atag in soup.find_all('a', href=True):
-        href = atag['href']
-        if re.search(r'/li/\d+', href):
+    for link in soup.find_all("a", href=re.compile(r"/li/\d+")):
+        href = link.get("href")
+        if href:
             urllist.append(href)
 
     if not urllist:
         print("DEBUG: No /li/ links found. Sampling <a> tags:")
-        for atag in list(soup.find_all('a'))[:10]:
-            print(" ", str(atag)[:200])
+        for link in soup.find_all("a", href=True)[:10]:
+            print(f"  {link['href'][:200]}")
         print("END DEBUG")
 
     result = []
     for href in set(urllist):
-        if href.startswith('/'):
-            result.append(BASE_URL.rstrip('/') + href)
-        elif href.startswith('http'):
+        if href.startswith("/"):
+            result.append(f"{BASE_URL.rstrip('/')}{href}")
+        elif href.startswith("http"):
             result.append(href)
         else:
-            result.append(BASE_URL + href)
+            result.append(f"{BASE_URL}{href}")
     return result
 
 
-def parse_page2(html):
-    soup = BeautifulSoup(html, 'html.parser')
-    h1 = soup.find('h1', class_="entry_title")
-    if not h1:
-        return None, ""
-    title = h1.get_text(strip=True)
-    desc_box = soup.find('div', class_="description_box")
-    description = desc_box.get_text(strip=True) if desc_box else ""
+def parse_page2(html: str):
+    """Extract title and description from detail page."""
+    soup = BeautifulSoup(html, "html.parser")
+    title_tag = soup.find("h1", class_="entry_title")
+    desc_tag = soup.find("div", class_="description_box")
+
+    title = title_tag.get_text(strip=True) if title_tag else None
+    description = desc_tag.get_text(strip=True) if desc_tag else ""
     return title, description
 
 
-async def translate_text(client, text, target_lang, source_lang="auto", max_retries=5):
+# Translation cache
+_translation_cache = {}
+
+
+async def translate_text(
+    client: httpx.AsyncClient,
+    text: str,
+    target_lang: str,
+    source_lang: str = "auto",
+) -> str:
+    """Translate text using Google Translate API."""
     if not text or not target_lang:
         return ""
 
@@ -129,105 +106,116 @@ async def translate_text(client, text, target_lang, source_lang="auto", max_retr
     if cache_key in _translation_cache:
         return _translation_cache[cache_key]
 
-    from urllib.parse import quote
-    q_text = quote(text, safe='')
-    gt_url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl={source_lang}&tl={target_lang}&dt=t&q={q_text}"
-
     async with translate_sem:
-        for attempt in range(max_retries):
+        for attempt in range(5):
             try:
-                response = await client.get(gt_url, timeout=15.0)
+                response = await client.get(
+                    "https://translate.googleapis.com/translate_a/single",
+                    params={
+                        "client": "gtx",
+                        "sl": source_lang,
+                        "tl": target_lang,
+                        "dt": "t",
+                        "q": text,
+                    },
+                    timeout=15.0,
+                )
+                if response.status_code == 429:
+                    wait = (2 ** attempt) + random.random()
+                    print(f"Translation 429 (attempt {attempt + 1}), waiting {wait:.1f}s...")
+                    await asyncio.sleep(wait)
+                    continue
                 response.raise_for_status()
                 data = response.json()
-                translated = "".join(item[0] for item in data[0] if item)
+                translated = "".join(item[0] for item in data[0] if item and item[0])
                 _translation_cache[cache_key] = translated
                 await asyncio.sleep(0.5)
                 return translated
-
             except httpx.HTTPStatusError as e:
-                if e.response.status_code == 429:
-                    wait = (2 ** attempt) + random.uniform(0, 1)
-                    print(f"Translation 429 (attempt {attempt + 1}), waiting {wait:.1f}s...")
-                    await asyncio.sleep(wait)
-                else:
-                    print(f"Translation HTTP error {e.response.status_code} for '{text[:50]}...': {e}")
-                    break
-            except (httpx.RequestError, json.JSONDecodeError) as e:
+                print(f"Translation HTTP {e.response.status_code} for '{text[:50]}...' (no retry)")
+                return ""
+            except Exception as e:
                 print(f"Translation attempt {attempt + 1} failed for '{text[:50]}...': {e}")
-                if attempt < max_retries - 1:
+                if attempt < 4:
                     await asyncio.sleep(2 ** attempt)
                 else:
-                    print(f"Max retries reached for translation of '{text[:50]}...'")
                     return ""
-            except Exception as e:
-                print(f"Unexpected error during translation for '{text[:50]}...': {e}")
-                return ""
-
     return ""
 
 
-def truncate_discord(msg, limit=DISCORD_MSG_LIMIT):
+def truncate_discord(msg: str, limit: int = DISCORD_MSG_LIMIT) -> str:
+    """Truncate message to fit Discord limit."""
     if len(msg) <= limit:
         return msg
     return msg[:limit] + "\n…"
 
 
-async def send_discord_message(client, message, webhook_urls):
+async def send_discord_message(
+    client: httpx.AsyncClient,
+    message: str,
+    webhook_urls: List[str],
+):
+    """Send message to Discord webhooks with rate limit handling."""
     if not webhook_urls:
         print("Discord webhook URLs not set. Skipping Discord message.")
         return
 
     payload = {"content": message}
     for webhook_url in webhook_urls:
-        retries = 5
-        delay = 1.0
+        delay = 1
         success = False
-        for _ in range(retries):
+        for _ in range(5):
             try:
                 async with discord_sem:
-                    response = await client.post(webhook_url, json=payload, timeout=30.0)
-                response.raise_for_status()
-                print(f"Message sent to Discord successfully via {webhook_url}.")
-                success = True
-                break
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code == 429:
-                    retry_after = float(e.response.headers.get("Retry-After", delay))
+                    response = await client.post(webhook_url, json=payload)
+                if response.status_code == 204:
+                    print(f"Message sent to Discord successfully via {webhook_url}.")
+                    success = True
+                    break
+                elif response.status_code == 429:
+                    retry_after = float(response.headers.get("retry-after", delay))
                     print(f"Rate limited. Retrying in {retry_after} seconds...")
                     await asyncio.sleep(retry_after)
                     delay *= 2
                 else:
-                    print(f"Error sending message to Discord via {webhook_url}: {e}")
+                    print(f"Error sending message to Discord via {webhook_url}: {response.status_code}")
                     break
-            except httpx.RequestError as e:
+            except Exception as e:
                 print(f"Error sending message to Discord via {webhook_url}: {e}")
                 break
         if not success:
-            print(f"Failed to send message to {webhook_url} after {retries} retries.")
+            print(f"Failed to send message to {webhook_url} after 5 retries.")
 
 
-def pack_batches(messages, limit=DISCORD_MSG_LIMIT):
+def pack_batches(messages: List[str], limit: int = DISCORD_MSG_LIMIT) -> List[str]:
+    """Pack messages into batches respecting Discord character limit."""
     batches = []
     batch = []
     batch_len = 0
-    for m in messages:
-        extra = len(m) + (1 if batch else 0)
+    for msg in messages:
+        extra = len(msg) + (1 if batch else 0)
         if batch and batch_len + extra > limit:
             batches.append("\n".join(batch))
-            batch = [m]
-            batch_len = len(m)
+            batch = [msg]
+            batch_len = len(msg)
         else:
-            batch.append(m)
+            batch.append(msg)
             batch_len += extra
     if batch:
         batches.append("\n".join(batch))
     return batches
 
 
-async def process_link(client, link, translate, target_lang, item_number):
+async def process_link(
+    client: httpx.AsyncClient,
+    link: str,
+    translate: bool,
+    target_lang: str,
+    item_number: int,
+):
+    """Process a single Togetter link."""
     html = await fetch_html(client, link)
-    if not html:
-        print(f"Failed to fetch detail page: {link}")
+    if html is None:
         return None, f"Failed to fetch detail page: {link}\n", None
 
     title, description = parse_page2(html)
@@ -236,12 +224,12 @@ async def process_link(client, link, translate, target_lang, item_number):
 
     await asyncio.sleep(5)
 
-    translated_title = ""
-    translated_description = ""
     if translate:
         translated_title = await translate_text(client, title, target_lang)
-        if description:
-            translated_description = await translate_text(client, description, target_lang)
+        translated_description = await translate_text(client, description, target_lang) if description else ""
+    else:
+        translated_title = ""
+        translated_description = ""
 
     console_output = f"**{item_number}. {title}**\n🔗 <{link}>\n"
     if translated_title:
@@ -271,119 +259,159 @@ async def process_link(client, link, translate, target_lang, item_number):
     return record, console_output, discord_msg
 
 
-async def process_category(client, cat):
+async def process_category(client: httpx.AsyncClient, category: str) -> List[str]:
+    """Process a category and return list of links."""
     urllist = []
     for x in range(PAGES_TO_SCRAPE):
         page = PAGES_TO_SCRAPE - x
-        target_url = f"{BASE_URL}{cat}?page={page}"
+        target_url = f"{BASE_URL}{category}?page={page}"
         html = await fetch_html(client, target_url)
         if html:
             urllist.extend(parse_page(html))
         else:
             print(f"Failed to fetch: {target_url}")
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(1)
     return list(set(urllist))
 
 
-def generate_markdown(records, generated_at):
+def filter_records_by_keywords(records: List[dict], keywords: List[str]) -> List[dict]:
+    """Filter records by keywords (case-insensitive OR match)."""
+    if not keywords:
+        return records
+    filtered = []
+    for rec in records:
+        content = f"{rec['title']} {rec['description']}".lower()
+        if any(kw.lower() in content for kw in keywords):
+            filtered.append(rec)
+    return filtered
+
+
+def write_jsonl(records: List[dict], filepath: str):
+    """Write records to JSONL file."""
+    count = 0
+    with open(filepath, "w", encoding="utf-8") as f:
+        for rec in records:
+            text_parts = [rec["title"]]
+            if rec["description"]:
+                text_parts.append(rec["description"])
+            entry = {
+                "text": "。".join(text_parts),
+                "url": rec["link"],
+            }
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            count += 1
+    print(f"JSONL saved to: {filepath} ({count} records)")
+
+
+def generate_markdown(records: List[dict], generated_at: str) -> str:
+    """Generate Markdown content from records."""
     lines = [
         "# Togetter Scraping Results\n",
         f"Generated: {generated_at}\n",
         f"Total items: {len(records)}\n",
         "---\n",
     ]
-
     for rec in records:
         lines.append(f"\n## {rec['item_number']}. {rec['title']}\n\n")
         lines.append(f"- **Link:** {rec['link']}\n")
-        if rec['translated_title']:
+        if rec["translated_title"]:
             lines.append(f"- **Translated Title:** {rec['translated_title']}\n")
-        if rec['description']:
+        if rec["description"]:
             lines.append(f"- **Description:** {rec['description']}\n")
-        if rec['translated_description']:
+        if rec["translated_description"]:
             lines.append(f"- **Translated Description:** {rec['translated_description']}\n")
         lines.append("\n---\n")
-
     return "".join(lines)
 
 
-async def main(args):
-    webhook_urls = args.webhook_urls if args.webhook_urls else DISCORD_WEBHOOK_URLS
+async def main():
+    parser = argparse.ArgumentParser(description="Scrape Togetter and optionally send to Discord.")
+    parser.add_argument("--url", type=str, help="Scrape a single URL instead of a category.")
+    parser.add_argument("-t", "--translate", action="store_true", help="Translate titles and descriptions.")
+    parser.add_argument("-l", "--lang", type=str, default="en", help="Target language for translation.")
+    parser.add_argument("-d", "--discord", action="store_true", help="Send results to Discord.")
+    parser.add_argument("--webhook-urls", nargs="+", default=[], help="Discord webhook URLs to send messages to.")
+    parser.add_argument("-o", "--output-md", type=str, help="Write results to a Markdown file (e.g. result.md).")
+    parser.add_argument("--output-jsonl", type=str, help="Write results to a JSONL file for TTS (e.g. togetter.jsonl).")
+    parser.add_argument("-k", "--keywords", nargs="+", default=[], help="Filter posts containing any of these keywords (case-insensitive).")
+    parser.add_argument("--categories", nargs="+", default=["recentpopular"], help="Categories to scrape (e.g. hot recentpopular recent review).")
+    args = parser.parse_args()
 
     async with httpx.AsyncClient(
-        timeout=30.0,
-        headers=HEADERS,
         follow_redirects=True,
+        timeout=httpx.Timeout(30.0),
+        headers=HEADERS,
     ) as client:
         if args.url:
             print(f"Processing single URL: {args.url}")
             record, console, discord_msg = await process_link(
                 client, args.url, args.translate, args.lang, 1
             )
-            print(console, end="")
-
+            if console:
+                print(console, end="")
             if args.discord and discord_msg:
-                await send_discord_message(client, discord_msg, webhook_urls)
+                await send_discord_message(client, discord_msg, args.webhook_urls)
 
-            if args.output_md:
-                if record:
-                    md = generate_markdown([record], datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            if record:
+                if args.output_md:
+                    md = generate_markdown(
+                        [record],
+                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    )
                     with open(args.output_md, "w", encoding="utf-8") as f:
                         f.write(md)
                     print(f"Markdown saved to: {args.output_md}")
-                else:
-                    print("Warning: No record generated. Markdown file not written.")
 
-            if args.output_jsonl:
-                if record:
+                if args.output_jsonl:
                     filtered = filter_records_by_keywords([record], args.keywords)
-                    if filtered or not args.keywords:
-                        write_jsonl(filtered if args.keywords else [record], args.output_jsonl)
+                    if filtered:
+                        write_jsonl(filtered, args.output_jsonl)
                     else:
                         print("Warning: Record did not match keywords. JSONL not written.")
-                else:
+            else:
+                if args.output_md:
+                    print("Warning: No record generated. Markdown file not written.")
+                if args.output_jsonl:
                     print("Warning: No record generated. JSONL file not written.")
             return
 
-        tasks = [
-            asyncio.create_task(process_category(client, cat))
-            for cat in args.categories
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # Multi-category scraping
+        tasks = [asyncio.create_task(process_category(client, cat)) for cat in args.categories]
+        category_results = await asyncio.gather(*tasks, return_exceptions=True)
 
         all_links = []
-        for res in results:
-            if isinstance(res, Exception):
-                print(f"Category error: {res}")
-                continue
-            all_links.extend(res)
+        for result in category_results:
+            if isinstance(result, list):
+                all_links.extend(result)
+            else:
+                print(f"Category task error: {result}")
 
-        all_links = list(set(all_links))
-        print(f"Total links found: {len(all_links)}")
-
-        link_tasks = [
-            asyncio.create_task(
-                process_link(client, link, args.translate, args.lang, i + 1)
-            )
-            for i, link in enumerate(all_links) if link
-        ]
-        link_results = await asyncio.gather(*link_tasks, return_exceptions=True)
+        unique_links = list(set(all_links))
+        print(f"Total links found: {len(unique_links)}")
 
         records = []
         console_outputs = []
         discord_messages = []
 
-        for res in link_results:
-            if isinstance(res, Exception):
-                print(f"Link error: {res}")
-                continue
-            record, console_str, discord_str = res
-            if record:
-                records.append(record)
-            if console_str:
-                console_outputs.append(console_str)
-            if discord_str:
-                discord_messages.append(discord_str)
+        link_tasks = [
+            asyncio.create_task(
+                process_link(client, link, args.translate, args.lang, i + 1)
+            )
+            for i, link in enumerate(unique_links)
+        ]
+        link_results = await asyncio.gather(*link_tasks, return_exceptions=True)
+
+        for result in link_results:
+            if isinstance(result, tuple):
+                record, console, discord_msg = result
+                if record:
+                    records.append(record)
+                if console:
+                    console_outputs.append(console)
+                if discord_msg:
+                    discord_messages.append(discord_msg)
+            else:
+                print(f"Link error: {result}")
 
         print(f"Total records collected: {len(records)}")
 
@@ -393,15 +421,18 @@ async def main(args):
         if args.discord:
             batches = pack_batches(discord_messages)
             for batch in batches:
-                await send_discord_message(client, batch, webhook_urls)
+                await send_discord_message(client, batch, args.webhook_urls)
 
+        filtered_records = filter_records_by_keywords(records, args.keywords)
         if args.keywords:
-            records = filter_records_by_keywords(records, args.keywords)
-            print(f"Records after keyword filter: {len(records)}")
+            print(f"Records after keyword filter: {len(filtered_records)}")
 
         if args.output_md:
-            if records:
-                md = generate_markdown(records, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            if filtered_records:
+                md = generate_markdown(
+                    filtered_records,
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                )
                 with open(args.output_md, "w", encoding="utf-8") as f:
                     f.write(md)
                 print(f"Markdown saved to: {args.output_md}")
@@ -409,26 +440,11 @@ async def main(args):
                 print("Warning: No records collected. Markdown file not written.")
 
         if args.output_jsonl:
-            if records:
-                write_jsonl(records, args.output_jsonl)
+            if filtered_records:
+                write_jsonl(filtered_records, args.output_jsonl)
             else:
                 print("Warning: No records collected. JSONL file not written.")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Scrape Togetter and optionally send to Discord.")
-    parser.add_argument("--url", help="Scrape a single URL instead of a category.")
-    parser.add_argument("-t", "--translate", action="store_true", help="Translate titles and descriptions.")
-    parser.add_argument("-l", "--lang", default="en", help="Target language for translation.")
-    parser.add_argument("-d", "--discord", action="store_true", help="Send results to Discord.")
-    parser.add_argument("--webhook-urls", nargs="+", help="Discord webhook URLs to send messages to.")
-    parser.add_argument("-o", "--output-md", metavar="FILE", help="Write results to a Markdown file (e.g. result.md).")
-    parser.add_argument("--output-jsonl", metavar="FILE", help="Write results to a JSONL file for TTS (e.g. togetter.jsonl).")
-    parser.add_argument("--keywords", nargs="+", help="Filter posts containing any of these keywords (case-insensitive).")
-    parser.add_argument("--categories", nargs="+", default=["recentpopular"], help="Categories to scrape (e.g. hot recentpopular recent review).")
-
-    # Jupyter 等で -f が渡される場合の対処（必要に応じて）
-    argv = [arg for arg in sys.argv[1:] if not arg.startswith("-f")]
-    args = parser.parse_args(argv)
-
-    asyncio.run(main(args))
+    asyncio.run(main())
