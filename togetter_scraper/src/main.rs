@@ -117,7 +117,7 @@ async fn fetch_html(state: &AppState, url: &str, max_retries: usize) -> Option<S
                 }
                 Err(e) => Err(e.to_string()),
             }
-        }; // permit 解放
+        };
 
         match outcome {
             Ok((status, Some(body))) if status.is_success() => {
@@ -466,7 +466,15 @@ fn generate_markdown(records: &[Record], generated_at: &str) -> String {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    let webhook_urls = args.webhook_urls;
+    let webhook_urls: Vec<String> = args.webhook_urls;
+    let translate: bool = args.translate;
+    let lang: String = args.lang;
+    let keywords: Vec<String> = args.keywords;
+    let categories: Vec<String> = args.categories;
+    let url: Option<String> = args.url;
+    let discord: bool = args.discord;
+    let output_md: Option<String> = args.output_md;
+    let output_jsonl: Option<String> = args.output_jsonl;
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -482,55 +490,55 @@ async fn main() -> Result<()> {
         translation_cache: Arc::new(Mutex::new(HashMap::new())),
     };
 
-    let translate = args.translate;
-    let lang = args.lang.clone();
-    let keywords = args.keywords.clone();
-
-    if let Some(url) = args.url {
+    if let Some(url) = url {
         println!("Processing single URL: {}", url);
         let (record, console, discord_msg) = process_link(&state, &url, translate, &lang, 1).await;
         print!("{}", console);
 
-        if args.discord {
+        if discord {
             if let Some(msg) = discord_msg {
                 send_discord_message(&state, &msg, &webhook_urls).await;
             }
         }
 
-        if let Some(path) = args.output_md {
-            if let Some(rec) = record {
-                let md = generate_markdown(&[rec], &Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
-                std::fs::write(&path, md)?;
+        // FIX: record.as_ref() で borrow。ムーブしない。
+        if let Some(rec) = record.as_ref() {
+            if let Some(path) = &output_md {
+                let md = generate_markdown(
+                    &[rec.clone()],
+                    &Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                );
+                std::fs::write(path, md)?;
                 println!("Markdown saved to: {}", path);
-            } else {
-                println!("Warning: No record generated. Markdown file not written.");
             }
-        }
 
-        if let Some(path) = args.output_jsonl {
-            if let Some(rec) = record {
-                let filtered = filter_records_by_keywords(&[rec], &keywords);
+            if let Some(path) = &output_jsonl {
+                let filtered = filter_records_by_keywords(&[rec.clone()], &keywords);
                 if filtered.is_empty() {
                     println!("Warning: Record did not match keywords. JSONL not written.");
                 } else {
-                    write_jsonl(&filtered, &path)?;
+                    write_jsonl(&filtered, path)?;
                 }
-            } else {
+            }
+        } else {
+            if output_md.is_some() {
+                println!("Warning: No record generated. Markdown file not written.");
+            }
+            if output_jsonl.is_some() {
                 println!("Warning: No record generated. JSONL file not written.");
             }
         }
         return Ok(());
-    }
-
-    let category_list = if args.categories.is_empty() {
+    } 
+    
+    let category_list: Vec<String> = if categories.is_empty() {
         vec!["recentpopular".to_string()]
     } else {
-        args.categories
+        categories
     };
 
-    let cat_tasks: Vec<_> = category_list.iter().map(|cat| {
+    let cat_tasks: Vec<_> = category_list.into_iter().map(|cat| {
         let state = state.clone();
-        let cat = cat.clone();
         tokio::spawn(async move { process_category(&state, &cat).await })
     }).collect();
 
@@ -583,7 +591,7 @@ async fn main() -> Result<()> {
         print!("{}", out);
     }
 
-    if args.discord {
+    if discord {
         let batches = pack_batches(&discord_messages, DISCORD_MSG_LIMIT);
         for batch in batches {
             send_discord_message(&state, &batch, &webhook_urls).await;
@@ -598,7 +606,7 @@ async fn main() -> Result<()> {
         records
     };
 
-    if let Some(path) = args.output_md {
+    if let Some(path) = output_md {
         if !filtered_records.is_empty() {
             let md = generate_markdown(&filtered_records, &Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
             std::fs::write(&path, md)?;
@@ -608,7 +616,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    if let Some(path) = args.output_jsonl {
+    if let Some(path) = output_jsonl {
         if !filtered_records.is_empty() {
             write_jsonl(&filtered_records, &path)?;
         } else {
